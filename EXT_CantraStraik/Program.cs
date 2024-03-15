@@ -5,485 +5,303 @@ using System.Collections.Concurrent;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
+using EXT_CantraStraik;
 
-namespace EXT_CantraStraik
+//init swed
+Swed swed = new Swed("cs2");
+
+//get client module
+IntPtr clientDll = swed.GetModuleBase("client.dll");
+
+[DllImport("user32.dll")]
+static extern short GetAsyncKeyState(int vKey);
+
+
+Thread hotkeyThread = new Thread(HotkeyListenerLoop) {IsBackground = true };
+hotkeyThread.Start();
+
+
+//get init renderer
+Renderer renderer = new Renderer();
+Thread renderThread = new Thread(new ThreadStart(renderer.Start().Wait));
+renderThread.Start();
+
+
+
+//get screensize from renderer
+
+Vector2 screenSize = renderer.windowSize;
+
+//store entities
+List<Entity> entities = new List<Entity>();
+Entity localPlayer = new Entity();
+
+Offsets offsets = new Offsets();
+//loop
+
+Thread triggerBotLogic = new Thread(TriggerBotLogic) { IsBackground = true };
+triggerBotLogic.Start();
+
+Thread bombTimerLogic = new Thread(BombTimerLogic) { IsBackground = true };
+bombTimerLogic.Start();
+bool isF10KeyPressed = false;
+
+
+bool glowStatus = false;
+string spottedStatus = "";
+
+while (true)
 {
-    class Program : Overlay
+    entities.Clear();
+    //get entity list
+    IntPtr entityList = swed.ReadPointer(clientDll, offsets.dwEntityList);
+    //make entry
+    IntPtr listEntry = swed.ReadPointer(entityList, 0x10);
+    IntPtr localPlayerPawn = swed.ReadPointer(clientDll, offsets.dwLocalPlayerPawn);
+    //get local player
+    IntPtr currentLPController = swed.ReadPointer(listEntry, 0x78);
+
+    //get team, so we can compare
+    localPlayer.address = localPlayerPawn;
+    localPlayer.teamNum = swed.ReadInt(localPlayer.address + offsets.m_iTeamNum);
+    localPlayer.playerName = swed.ReadString(currentLPController + offsets.m_iszPlayerName, 16).Split("\0")[0];
+    localPlayer.health = swed.ReadInt(localPlayer.address + offsets.m_iHealth);
+    localPlayer.position = swed.ReadVec(localPlayer.address + offsets.m_vOldOrigin);
+    localPlayer.viewOffset = swed.ReadVec(localPlayer.address + offsets.m_vecViewOffset);
+    localPlayer.entIndex = swed.ReadInt(localPlayer.address, offsets.m_iIDEntIndex);
+
+
+    for (int i = 0; i < 64; i++)
+    {
+        IntPtr currentController = swed.ReadPointer(listEntry, i * 0x78);
+        if (currentController == IntPtr.Zero)
+            continue;
+        int pawnHandle = swed.ReadInt(currentController + offsets.m_hPlayerPawn);
+        if (pawnHandle == 0)
+            continue;
+
+        //get current pawn
+        IntPtr listEntry2 = swed.ReadPointer(entityList, 0x8 * ((pawnHandle & 0x7FFF) >> 9) + 0x10);
+
+        if (listEntry2 == IntPtr.Zero)
+            continue;
+
+        //get current pawn 
+        IntPtr currentPawn = swed.ReadPointer(listEntry2, 0x78 * (pawnHandle & 0x1FF));
+        if (currentPawn == IntPtr.Zero)
+            continue;
+        //check lifeState
+        int lifeState = swed.ReadInt(currentPawn + offsets.m_lifeState);
+        if (lifeState != 256)
+            continue;
+
+        //get matrix
+        float[] viewMatrix = swed.ReadMatrix(clientDll + offsets.dwViewMatrix);
+
+        //populate entity
+        Entity entity = new Entity();
+        entity.teamNum = swed.ReadInt(currentPawn + offsets.m_iTeamNum);
+        entity.position = swed.ReadVec(currentPawn + offsets.m_vOldOrigin);
+        entity.viewOffset = swed.ReadVec(currentPawn + offsets.m_vecViewOffset);
+        entity.position2D = Calculate.WorldToScreen(viewMatrix, entity.position, screenSize);
+        entity.viewPosition2D = Calculate.WorldToScreen(viewMatrix, Vector3.Add(entity.position, entity.viewOffset), screenSize);
+        entity.health = swed.ReadInt(currentPawn + offsets.m_iHealth);
+        entity.address = currentPawn;
+        entity.playerName = swed.ReadString(currentController + offsets.m_iszPlayerName, 16).Split("\0")[0];
+        entity.spotted = swed.ReadBool(currentPawn, offsets.m_entitySpottedState + offsets.m_bSpotted);
+        if(renderer.enableRadar)
+        {
+            swed.WriteBool(currentPawn, offsets.m_entitySpottedState + offsets.m_bSpotted, true);
+
+        }
+        if(renderer.enableGlow)
+        {
+            swed.WriteFloat(currentPawn + offsets.m_flDetectedByEnemySensorTime, 86400);
+
+        }
+        glowStatus = renderer.enableGlow;
+        if (glowStatus == false)
+        {
+            swed.WriteFloat(currentPawn + offsets.m_flDetectedByEnemySensorTime, 0);
+        }
+
+
+        spottedStatus = entity.spotted == true ? "Spotted" : " "; //string depending on if entity is spotted   
+        entities.Add(entity);
+
+    }
+
+
+    renderer.UpdateLocalPlayer(localPlayer);
+    renderer.UpdateEntities(entities);
+
+}
+
+
+Vector3 Normalize(Vector3 angel)
+{
+    while (angel.Y < -180) angel.Y += 360;
+    while (angel.Y > 180) angel.Y -= 360;
+    if (angel.X < -89) angel.X = -89;
+    if (angel.X > 89) angel.X = 89;
+    return angel;
+}
+
+
+
+
+void HotkeyListenerLoop()
+{
+    while (true)
+    {
+        isF10KeyPressed = GetAsyncKeyState(0x2D) < 0;
+
+        if (isF10KeyPressed)
+        {
+            renderer.showMenu = !renderer.showMenu; // Toggle the menu
+            Thread.Sleep(100); // Debounce
+        }
+
+        Thread.Sleep(10); // Adjust polling interval as needed
+    }
+}
+
+
+void TriggerBotLogic()
+{
+    Vector3 oPunch = new Vector3(0, 0, 0);
+
+    while (true)
     {
 
-        //imports and structs
 
-        [DllImport("user32.dll")]
 
-        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-        [DllImport("user32.dll")]
-        static extern bool GetAsyncKeyState(int vKey); //handle hotkey
 
-        [StructLayout(LayoutKind.Sequential)]
-        public struct RECT
+
+        if (renderer.enableTriggerBot)
         {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
-        }
 
-        public RECT GetWindowRect(IntPtr hWnd)
-        {
-            RECT rect = new RECT();
-            GetWindowRect(hWnd, out rect);
-            return rect;
-        }
-
-        Swed swed = new Swed("cs2");
-
-        Offsets offsets = new Offsets();
-        ImDrawListPtr drawList;
-
-
-
-
-        //List<Entity> entities = new List<Entity>();
-
-        List<Entity> enemyTeam = new List<Entity>();
-        List<Entity> playerTeam = new List<Entity>();
-
-
-
-
-        IntPtr clientDll;
-
-
-
-        Vector4 tColor = new Vector4(0, 0, 1, 1);
-        Vector4 eColor = new Vector4(1, 0, 0, 1);
-        Vector4 hBarColor = new Vector4(0, 1, 0, 1);
-        Vector4 hTextColor = new Vector4(0, 0, 0, 1);
-
-
-        //screen variables, later update
-
-        Vector2 windowLocation = new Vector2(0, 0);
-        Vector2 windowSize = new Vector2(2560, 1440);
-        Vector2 lineOrigin = new Vector2(2560 / 2, 1440);
-        Vector2 windowCenter = new Vector2(2560 / 2, 1440 / 2);
-
-        public ConcurrentQueue<Entity> entities = new ConcurrentQueue<Entity>();
-        private Entity localPlayer = new Entity();
-        private readonly object entityLock = new object();
-
-        //imgui checkbox
-
-        bool showMenu = true;
-
-        bool enableESP = true;
-
-        bool enableTeamLine = true;
-        bool enableTeamBox = true;
-        bool enableTeamDot = false;
-        bool enableTeamHealthBar = true;
-        bool enableTeamDistance = true;
-
-        bool enableEnemyLine = true;
-        bool enableEnemyBox = true;
-        bool enableEnemyDot = false;
-        bool enableEnemyHealthBar = true;
-        bool enableEnemyDistance = true;
-
-        //misc
-        bool enableNoFlash = false;
-        bool enableBunnyHop = false;
-        bool enableGlow = false;
-
-        //aim
-        bool enableTriggerBot = false;
-        bool enableTriggerTeam = false;
-        float triggerDelay = 50f;
-
-
-        protected override void Render()
-        {
-            throw new NotImplementedException();
-            //only render stuff
-            DrawMenu();
-            DrawOverlay();
-            Esp();
-            ImGui.End();
-        }
-
-
-
-        public Entity GetLocalPlayer() //get local player
-        {
-            lock(entityLock)
+            if (GetAsyncKeyState(0x6) < 0)
             {
-               return localPlayer;
+                IntPtr entityList = swed.ReadPointer(clientDll, offsets.dwEntityList);
+                //int entIndex = swed.ReadInt(localPlayer.address, offsets.m_iIDEntIndex);
+
+
+                                        
+            if (localPlayer.entIndex != -1) 
+            {
+                IntPtr listEntry = swed.ReadPointer(entityList, 0x8 * ((localPlayer.entIndex & 0x7FFF) >> 9) + 0x10);
+                IntPtr currentPawn = swed.ReadPointer(listEntry, 0x78 * (localPlayer.entIndex & 0x1FF));
+
+                int entityTeam = swed.ReadInt(currentPawn + offsets.m_iTeamNum);
+
+                if(entityTeam != localPlayer.teamNum || renderer.enableTriggerTeam)
+                {
+
+                        if (localPlayer.entIndex > 0)
+                        {
+                            Thread.Sleep((int)renderer.triggerDelay);
+                            swed.WriteInt(clientDll + offsets.dwForceAttack, 65537);
+                            Thread.Sleep(1);
+                            swed.WriteInt(clientDll + offsets.dwForceAttack, 256);
+
+                        }
+
+                }
+            }
+
+            }
+
+        }
+
+
+
+
+
+
+
+
+
+        if (renderer.enableNoFlash)
+        {
+            float flashDuration = swed.ReadFloat(localPlayer.address, offsets.m_flFlashBangTime);
+            if (flashDuration > 0)
+            {
+
+                swed.WriteFloat(localPlayer.address, offsets.m_flFlashBangTime, 0f);
+
             }
         }
 
 
-        void Esp()
-        {
-            drawList = ImGui.GetWindowDrawList(); // get overlay
+        //read gameRUles
 
-            if(enableESP)
+
+
+
+
+
+        if (renderer.enableRCS)
+        {
+            Vector3 viewAngles = swed.ReadVec(clientDll + offsets.dwViewAngles);
+            int shotsFired = swed.ReadInt(localPlayer.address, offsets.m_iShotsFired);
+            Vector3 aimPunch = swed.ReadVec(localPlayer.address, offsets.m_aimPunchAngle);
+
+            if (shotsFired > 1)
             {
-                try
+                Vector3 punchAngle = aimPunch * 2 * renderer.compensationFactor;
+                Vector3 newAngle = viewAngles + oPunch - punchAngle;
+                newAngle = Normalize(newAngle);
+                swed.WriteVec(clientDll + offsets.dwViewAngles, newAngle);
+                Thread.Sleep(1);
+
+            }
+
+            oPunch = aimPunch * 2 * renderer.compensationFactor; // Retain some of the recoil for the next shot
+        }
+   
+
+    }
+
+    
+}
+
+void BombTimerLogic()
+{
+    bool bombPlanted = false;
+
+    IntPtr gameRules = swed.ReadPointer(clientDll, offsets.dwGameRules);
+
+    while (true)
+    {
+        if (gameRules == IntPtr.Zero)
+            continue;
+        if (renderer.enableBombTimer)
+        {
+            bombPlanted = swed.ReadBool(gameRules, offsets.m_bBombPlanted);
+            if (bombPlanted)
+            {
+                for (int i = 0; i < 40; i++)
                 {
-                    foreach(var entity in entities)
+                    bombPlanted = swed.ReadBool(gameRules, offsets.m_bBombPlanted);
+                    if (!bombPlanted)//
                     {
-                        if(entity.address == IntPtr.Zero)
-                            continue;
-                        if(entity.teamNum==localPlayer.teamNum)
-                        {
-                            DrawVisuals(entity, tColor, enableTeamLine, enableTeamBox, enableTeamDot, enableTeamHealthBar, enableTeamDistance);
-                        }
-                        else
-                        {
-                            DrawVisuals(entity, eColor, enableEnemyLine, enableEnemyBox, enableEnemyDot, enableEnemyHealthBar, enableEnemyDistance);
-                        }
+                        break;
                     }
+                    //calculate time left
+                    int timeLeft = 40 - i;
+                    renderer.timeLeft = timeLeft;
+                    renderer.bombPlanted = true;
+                    Thread.Sleep(1000);
                 }
-                catch { }
-            }
-        }
-        void DrawVisuals(Entity entity, Vector4 color, bool line, bool box, bool dot, bool healthBar, bool distance)
-        {
-            if(IsPixelInScreen(entity.originScreenPosition))
-            {
-                //convert our colors to uints
-
-                uint uintColor = ImGui.ColorConvertFloat4ToU32(color);
-                uint uintHBarColor = ImGui.ColorConvertFloat4ToU32(hBarColor);
-                uint uintHTextColor = ImGui.ColorConvertFloat4ToU32(hTextColor);
-
-                Vector2 boxWidth = new Vector2((entity.originScreenPosition.Y - entity.absScreenPosition.Y) / 2 , 0f); //width of the box
-                Vector2 boxStart = Vector2.Subtract(entity.absScreenPosition, boxWidth); //start of the box
-                Vector2 boxEnd = Vector2.Add(entity.originScreenPosition, boxWidth); //end of the box
-
-                //calculate healthbar stuff
-
-                float barPercentage = entity.health / 100f; //
-                Vector2 barHeight= new Vector2(0, barPercentage*(entity.originScreenPosition.Y - entity.absScreenPosition.Y));
-                Vector2 barStart = Vector2.Subtract(Vector2.Subtract(entity.originScreenPosition, boxWidth), barHeight);
-                Vector2 barEnd = Vector2.Subtract(entity.originScreenPosition, Vector2.Add(boxWidth, new Vector2(-4, 0)));
-            
-            
-
-                if(line)
-                {
-                    drawList.AddLine(lineOrigin, entity.originScreenPosition, uintColor, 3);
-                }
-                if(box)
-                {
-                    drawList.AddRect(boxStart, boxEnd, uintColor, 5);
-                }
-                if(dot)
-                {
-                    drawList.AddCircleFilled(entity.originScreenPosition, 5, uintColor);
-                }
-                if(healthBar)
-                {
-                    drawList.AddText(entity.originScreenPosition, uintHTextColor, $"HP: {entity.health}");
-                    drawList.AddRectFilled(barStart, barEnd, uintHBarColor);
-                }
-
-            }
-        }
-
-
-        bool IsPixelInScreen(Vector2 pixel)
-        {
-            return pixel.X > windowLocation.X && pixel.X < windowLocation.X + windowSize.X && pixel.Y > windowLocation.Y && pixel.Y < windowSize.Y + windowLocation.Y; //check if the pixel is in the screen
-        }
-
-
-
-
-        void DrawMenu()
-        {
-            ImGui.Begin("@Siyarbekir's Metin3 Menu");
-         
-            if(ImGui.BeginTabBar("Tabs"))
-            {
-                if(ImGui.BeginTabItem("General"))
-                {
-                    ImGui.Checkbox("Enable ESP", ref enableESP);
-                    ImGui.Separator();
-                    ImGui.Text("Team");
-                    ImGui.Checkbox("Enable Team Line", ref enableTeamLine);
-                    ImGui.Checkbox("Enable Team Box", ref enableTeamBox);
-                    ImGui.Checkbox("Enable Team Dot", ref enableTeamDot);
-                    ImGui.Checkbox("Enable Team Health Bar", ref enableTeamHealthBar);
-                    ImGui.Checkbox("Enable Team Distance", ref enableTeamDistance);
-                    ImGui.Separator();
-                    ImGui.Text("Enemy");
-                    ImGui.Checkbox("Enable Enemy Line", ref enableEnemyLine);
-                    ImGui.Checkbox("Enable Enemy Box", ref enableEnemyBox);
-                    ImGui.Checkbox("Enable Enemy Dot", ref enableEnemyDot);
-                    ImGui.Checkbox("Enable Enemy Health Bar", ref enableEnemyHealthBar);
-                    ImGui.Checkbox("Enable Enemy Distance", ref enableEnemyDistance);
-
-
-                    ImGui.EndTabItem();
-                }
-                if(ImGui.BeginTabItem("Aim"))
-                {
-                    ImGui.Checkbox("Enable TriggerBot", ref enableTriggerBot);
-                    ImGui.Checkbox("    ->Enable Trigger Team", ref enableTriggerTeam);
-                    ImGui.SliderFloat("Trigger Delay", ref triggerDelay, 15f, 300f);
-
-                }
-                if(ImGui.BeginTabItem("Misc"))
-                {
-                    ImGui.Text("Misc");
-                    ImGui.Checkbox("Enable noFlash", ref enableNoFlash);
-                    ImGui.Separator();
-                    ImGui.Checkbox("Enable Glow -NOT WORKING ATM-", ref enableGlow);
-                    ImGui.EndTabItem();
-                }
-                if(ImGui.BeginTabItem("Colors"))
-                {
-                    ImGui.ColorEdit4("Team Color", ref tColor);
-                    ImGui.ColorEdit4("Enemy Color", ref eColor);
-                    ImGui.ColorEdit4("Health Bar Color", ref hBarColor);
-                    ImGui.ColorEdit4("Health Text Color", ref hTextColor);
-                    ImGui.EndTabItem();
-                }
-            }
-
-            ImGui.End();
-        }
-
-        void DrawOverlay()
-        {
-            ImGui.SetNextWindowSize(windowSize);
-            ImGui.SetNextWindowPos(windowLocation);
-            ImGui.Begin("Overlay",  ImGuiWindowFlags.NoDecoration
-                | ImGuiWindowFlags.NoBackground
-                | ImGuiWindowFlags.NoBringToFrontOnFocus
-                | ImGuiWindowFlags.NoMove
-                | ImGuiWindowFlags.NoInputs
-                | ImGuiWindowFlags.NoCollapse
-                | ImGuiWindowFlags.NoScrollbar
-                | ImGuiWindowFlags.NoScrollWithMouse
-                );
-        }
-
-        ViewMatrix ReadMatrix(IntPtr matrixAddress)
-        {
-            var viewMatrix = new ViewMatrix();
-            var floatMatrix = swed.ReadMatrix(matrixAddress);
-
-
-            viewMatrix.m11 = floatMatrix[0];
-            viewMatrix.m12 = floatMatrix[1];
-            viewMatrix.m13 = floatMatrix[2];
-            viewMatrix.m14 = floatMatrix[3];
-
-            viewMatrix.m21 = floatMatrix[4];
-            viewMatrix.m22 = floatMatrix[5];
-            viewMatrix.m23 = floatMatrix[6];
-            viewMatrix.m24 = floatMatrix[7];
-
-            viewMatrix.m31 = floatMatrix[8];
-            viewMatrix.m32 = floatMatrix[9];
-            viewMatrix.m33 = floatMatrix[10];
-            viewMatrix.m34 = floatMatrix[11];
-
-            viewMatrix.m41 = floatMatrix[12];
-            viewMatrix.m42 = floatMatrix[13];
-            viewMatrix.m43 = floatMatrix[14];
-            viewMatrix.m44 = floatMatrix[15];
-
-            return viewMatrix;
-        }
-
-        Vector2 WorldToScreen(ViewMatrix matrix, Vector3 pos, int width, int height )
-        {
-
-            Vector2 screenCoordinates = new Vector2();
-
-
-            float screenW = (matrix.m41 * pos.X) + (matrix.m42 * pos.Y) + (matrix.m43 * pos.Z) + matrix.m44;
-
-            if(screenW > 0.001f)
-            {
-                float screenX = (matrix.m11 * pos.X) + (matrix.m12 * pos.Y) + (matrix.m13 * pos.Z) + matrix.m14;
-
-                float screenY = (matrix.m21 * pos.X) + (matrix.m22 * pos.Y) + (matrix.m23 * pos.Z) + matrix.m24;
-
-
-                float camX = width / 2;
-                float camY = height / 2;
-
-                //perform the perspective divide
-                float x = camX + (camX * screenX / screenW);
-                float y = camY - (camY * screenY / screenW);
-
-                screenCoordinates.X = x;
-                screenCoordinates.Y = y;
-
-                return screenCoordinates;
-
             }
             else
             {
-                return new Vector2(-99,-99);
+                renderer.timeLeft = -1;
+                renderer.bombPlanted = false;
             }
         }
-        void MainLogic()
-        {
 
-
-            var window = GetWindowRect(swed.GetProcess().MainWindowHandle);
-            windowLocation = new Vector2(window.Left, window.Top);
-            windowSize = Vector2.Subtract(new Vector2(window.Right, window.Bottom), windowLocation);
-            lineOrigin = new Vector2(windowLocation.X + windowSize.X/2, window.Bottom);
-            windowCenter = new Vector2(lineOrigin.X, window.Bottom - windowSize.Y/2);
-
-            clientDll = swed.GetModuleBase("client.dll");
-
-            while (true)
-            {
-
-                ReloadEntities();
-                if(enableNoFlash)
-                {
-                    float flashDuration = swed.ReadFloat(localPlayer.address, offsets.flasbangTime);
-                    if (flashDuration > 0)
-                    {
-
-                        swed.WriteFloat(localPlayer.address, offsets.flasbangTime, 0f);
-
-                    }
-                }
-
-                
-                if(enableGlow)
-                {
-                    
-                }
-
-                Thread.Sleep(3);
-
-
-
-            }
-        }
-        void ReloadEntities()
-        {
-            entities.Clear();
-            playerTeam.Clear();
-            enemyTeam.Clear();
-
-            localPlayer.address = swed.ReadPointer(clientDll, offsets.localPlayer);
-            UpdateEntity(localPlayer);
-
-            UpdateEntities();
-        }
-        void UpdateEntities()
-        {
-            for (int i = 0; i < 64; i++)
-            {
-                IntPtr entityAddress = swed.ReadPointer(clientDll, offsets.entityList + i * 0x08);
-
-                if (entityAddress == IntPtr.Zero)
-                    continue;
-
-
-                Entity entity = new Entity();
-                entity.address = entityAddress;
-
-
-                UpdateEntity(entity);
-
-                if(entity.health < 1 || entity.health > 100)
-                    continue;
-
-                
-                if(!entities.Any(element => element.origin.X == entity.origin.X))
-                {
-                    entities.Add(entity);
-
-                    if(entity.teamNum == localPlayer.teamNum)
-                    {
-                        playerTeam.Add(entity);
-                    }
-                    else
-                    {
-                        
-                        enemyTeam.Add(entity);
-                    }
-                }
-
-
-
-            }
-        }
-        void UpdateEntity(Entity entity)
-        {
-            entity.health = swed.ReadInt(entity.address, offsets.health);
-            entity.origin = swed.ReadVec(entity.address, offsets.origin);
-            entity.teamNum = swed.ReadInt(entity.address, offsets.teamNum);
-
-
-
-            //3d
-
-            entity.origin = swed.ReadVec(entity.address, offsets.origin);
-            entity.viewOffset = new Vector3(0, 0, 65);
-            entity.abs = Vector3.Add(entity.origin, entity.viewOffset);
-
-            //2d
-
-            var currentViewmatrix = ReadMatrix(clientDll + offsets.viewMatrix);
-            entity.originScreenPosition = Vector2.Add(WorldToScreen(currentViewmatrix, entity.origin, (int)windowSize.X, (int)windowSize.Y), windowLocation);
-            entity.absScreenPosition = Vector2.Add(WorldToScreen(currentViewmatrix, entity.abs, (int)windowSize.X, (int)windowSize.Y), windowLocation);
-
-
-
-        }
-
-        void TriggerBotLogic()
-        {
-            while(true)
-            {
-                if (enableTriggerBot)
-                {
-
-                    int entIndex = swed.ReadInt(localPlayer.address, offsets.iIDEntIndex);
-                    if (entIndex < 0)
-                        continue;
-
-                    if (GetAsyncKeyState(0x6))
-                    {
-                        if (entIndex > 0)
-                        {
-                            Thread.Sleep((int)triggerDelay);
-                            swed.WriteInt(clientDll + offsets.forceAttack, 65537);
-                            Thread.Sleep(1);
-                            swed.WriteInt(clientDll + offsets.forceAttack, 256);
-
-                        }
-                    }
-                }
-            }
-            
-        }
-        static void Main(string[] args)
-        {
-            //logic here
-
-            Program program = new Program();
-            program.Start().Wait();
-
-            Thread mainLogicThread = new Thread(program.MainLogic) { IsBackground = true };
-            mainLogicThread.Start();
-
-            
-            Thread triggerBotLogicThread = new Thread(program.TriggerBotLogic) { IsBackground = true };
-            triggerBotLogicThread.Start();
-        }
     }
+
 }
